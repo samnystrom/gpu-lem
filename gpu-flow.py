@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.24.2"
+__generated_with = "0.25.2"
 app = marimo.App(width="medium")
 
 
@@ -20,8 +20,9 @@ def _():
 @app.cell
 def _(np):
     width = 200
-    height = 200 
+    height = 100 
     nsims = 16
+    np.random.seed(0)
     elevation = np.random.random((nsims, height, width))
     #elevation = np.tile(10 * (1 - np.abs(np.linspace(-1.0, 1.0, width))), (height, 1)) + np.random.random((height, width)) * 0.1
     #elevation = np.load('z.npy').astype(np.float32)
@@ -80,7 +81,7 @@ def _(device, elevation, height, math, np, nsims, time, wgpu, width):
     drainage_area_buffer = device.create_buffer(
         label='drainage_area',
         size=nsims * width * height * 4,
-        usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC,
+        usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.COPY_SRC,
     )
 
     elevation_out_buffer = device.create_buffer(
@@ -147,7 +148,8 @@ def _(device, elevation, height, math, np, nsims, time, wgpu, width):
     @group(0) @binding(1) var<storage, read_write> elevation: array<f32>;
     // packed: in-degree in LS byte, flowdir in second byte
     @group(0) @binding(2) var<storage, read_write> flowdir: array<atomic<u32>>;
-    @group(0) @binding(3) var<storage, read_write> drainage_area: array<u32>;
+    // packed: in-degree in top 4 bits
+    @group(0) @binding(3) var<storage, read_write> drainage_area: array<atomic<u32>>;
     @group(0) @binding(4) var<storage, read_write> elevation_out: array<f32>;
 
     var<workgroup> tile: array<array<f32, 18>, 18>;
@@ -206,13 +208,14 @@ def _(device, elevation, height, math, np, nsims, time, wgpu, width):
             let downstream = vec2<u32>(pos.x + (dir >> 2) - 1, pos.y + (dir & 0x3) - 1);
             if (all(downstream >= vec2<u32>(0)) && all(downstream < dimensions.yz)) {
                 atomicAdd(&flowdir[offset + downstream.y * dimensions.y + downstream.x], 1);
+                atomicAdd(&drainage_area[offset + downstream.y * dimensions.y + downstream.x], 1 << 28);
             }
         }
 
         let i = offset + pos.y * dimensions.y + pos.x;
         atomicOr(&flowdir[i], dir << 8);
         // slope[i] = steepest;
-        drainage_area[i] = 1;
+        atomicAdd(&drainage_area[i], 1);
     }
     ''')
 
@@ -226,8 +229,12 @@ def _(device, elevation, height, math, np, nsims, time, wgpu, width):
     @group(0) @binding(1) var<storage, read_write> elevation: array<f32>;
     // packed: in-degree in LS byte, flowdir in second byte
     @group(0) @binding(2) var<storage, read_write> flowdir: array<u32>;
+    // packed: in-degree in top 4 bits
     @group(0) @binding(3) var<storage, read_write> drainage_area: array<atomic<u32>>;
     @group(0) @binding(4) var<storage, read_write> elevation_out: array<f32>;
+
+    const SHIFT = 28u;
+    const MASK = 0xfu << SHIFT;
 
     @compute @workgroup_size(1, 16, 16)
     fn main(@builtin(global_invocation_id) gid: vec3u) {
@@ -247,13 +254,15 @@ def _(device, elevation, height, math, np, nsims, time, wgpu, width):
         for (var spins = 0u; spins < dimensions.y * dimensions.z; spins++) {
             let idx = offset + pos.y * dimensions.y + pos.x;
             if (spins > 0) {
-                // the first thread to visit a cell takes responsibility for
-                // propagating its area downstream
-                let prev = atomicAdd(&drainage_area[idx], area);
-                if (prev == 1) {
-                    area++;
+                // the last thread to visit a cell propagates the upstream area, all others exit.
+                let prev = atomicSub(&drainage_area[idx], (1u << SHIFT) - area);
+                let indegree = (prev & MASK) >> SHIFT;
+                area += prev & ~MASK;
+                if (indegree > 1) {
+                    return;
                 }
             }
+
             let dir = flowdir[idx] >> 8;
             pos = vec2<u32>(pos.x + (dir >> 2) - 1, pos.y + (dir & 0x3) - 1);
             // underflow catches the <0 case
@@ -288,8 +297,8 @@ def _(device, elevation, height, math, np, nsims, time, wgpu, width):
         let idx = offset + pos.y * dimensions.y + pos.x;
 
         let k = 0.01;
-        let m = 1.0;
-        let n = 2.1;
+        let m = 0.5;
+        let n = 1.0;
         let u = 0.01 ;//+ random[idx] * 0.005;
         let dt = 1.0;
 
@@ -360,6 +369,7 @@ def _(device, elevation, height, math, np, nsims, time, wgpu, width):
         encoder = device.create_command_encoder()
         for j in range(min(n - i*group_size, group_size)):
             encoder.clear_buffer(flowdir_buffer)
+            encoder.clear_buffer(drainage_area_buffer)
 
             cpass = encoder.begin_compute_pass(timestamp_writes=wgpu.ComputePassTimestampWrites(
                 query_set=query_set,
